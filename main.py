@@ -226,12 +226,26 @@ class RWKV_Transducer(nn.Module):
         return predictions
 
 # --- 3. HELPER FUNCTIONS ---
-def estimate_flops(model, batch_size, time_steps, label_steps):
-    params = sum(p.numel() for p in model.parameters())
-    # RWKV-7 inference is approx 2 ops per param per step
-    # We factor in both the audio (time) and text (label) history
-    flops = 2 * params * (time_steps + label_steps) * batch_size
-    return flops / 1e6
+def estimate_flops(model, batch_size, time_steps, label_steps, is_training=False):
+    """Surgically accurate FLOPs calculation for Path vs Lattice workload"""
+    enc_params = sum(p.numel() for p in model.encoder.parameters())
+    pred_params = sum(p.numel() for p in model.predictor.parameters())
+    joiner_params = sum(p.numel() for p in model.joiner.parameters())
+
+    # 1. Sequential Components (Encoder + Predictor)
+    # These run once per time/label step regardless of path/lattice
+    seq_flops = 2 * (enc_params * time_steps + pred_params * label_steps)
+    
+    # 2. Joiner Component
+    if is_training:
+        # Full Lattice: Every T x U combination (used for loss)
+        join_ops = 2 * joiner_params * (time_steps * label_steps)
+    else:
+        # Greedy Path: Only T + U combinations (used for inference)
+        join_ops = 2 * joiner_params * (time_steps + label_steps)
+    
+    total_flops = (seq_flops + join_ops) * batch_size
+    return total_flops / 1e6
 
 def print_final_stats(model, time_steps, label_steps): 
     params = sum(p.numel() for p in model.parameters())
@@ -241,13 +255,15 @@ def print_final_stats(model, time_steps, label_steps):
     dim = model.encoder.blocks[0].dim
     state_kb = (n_layers * dim * 4) / 1024 # 4 bytes for float32
     
-    mflops = estimate_flops(model, 1, time_steps, label_steps)
+    inference_mflops = estimate_flops(model, 1, time_steps, label_steps, is_training=False)
+    training_mflops = estimate_flops(model, 1, time_steps, label_steps, is_training=True)
 
-    print(f"\n--- 10M PoC Model Report ---")
+    print(f"\n--- 19M Scale RWKV-T Report ---")
     print(f"Total Parameters: {params/1e6:.2f} Million")
-    print(f"Inference Workload: {mflops:.2f} MFLOPs (per audio segment)")
+    print(f"Inference Workload (Greedy): {inference_mflops:.2f} MFLOPs (per 1s audio)")
+    print(f"Training Workload (Lattice): {training_mflops:.2f} MFLOPs (per 1s audio)")
     print(f"Recurrent State Memory: {state_kb:.2f} KB (Fixed size)")
-    print(f"Alif B1 SRAM Usage: {(state_kb / 2048) * 100:.4f}%") # Out of 2MB
+    print(f"Alif B1 SRAM Usage: {(state_kb / 2048) * 100:.4f}%")
     print("-" * 30)
 
 # --- 4. EXECUTION ---

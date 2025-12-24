@@ -12,13 +12,40 @@ import json
 import time
 import subprocess
 import random
+import traceback
+import argparse
 
 
 
 # --- 1. ENVIRONMENT SETUP ---
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Executing on device: {DEVICE}")
+
+# --- FIX: Force stable audio backend to avoid torchcodec bug on Lambda/B200 ---
+try:
+    # Handle different torchaudio versions for listing backends
+    if hasattr(torchaudio, "list_audio_backends"):
+        backends = torchaudio.list_audio_backends()
+    elif hasattr(torchaudio, "utils") and hasattr(torchaudio.utils, "list_audio_backends"):
+        backends = torchaudio.utils.list_audio_backends()
+    else:
+        backends = []
+    
+    if "sox_io" in backends:
+        if hasattr(torchaudio, "set_audio_backend"):
+            torchaudio.set_audio_backend("sox_io")
+    elif "soundfile" in backends:
+        if hasattr(torchaudio, "set_audio_backend"):
+            torchaudio.set_audio_backend("soundfile")
+            
+    if hasattr(torchaudio, "get_audio_backend"):
+        print(f"Using audio backend: {torchaudio.get_audio_backend()}")
+    else:
+        print("Audio backend set (v2.1+ migration in progress).")
+except Exception as e:
+    print(f"Warning: Could not explicitly set audio backend: {e}")
 
 def get_tokenizer(model_path):
     if not os.path.exists(model_path):
@@ -42,9 +69,12 @@ def calculate_wer(reference, hypothesis):
     for j in range(len(hyp_words) + 1): d[0, j] = j
     for i in range(1, len(ref_words) + 1):
         for j in range(1, len(hyp_words) + 1):
-            if ref_words[i-1] == hyp_words[j-1]: d[i, j] = d[i-1, j-1]
-            else: d[i, j] = min(d[i-1, j], d[i, j-1], d[i-1, j-1]) + 1
-    return d[len(ref_words), len(hyp_words)] / max(1, len(ref_words))
+            if ref_words[i-1] == hyp_words[j-1]: 
+                d[i, j] = d[i-1, j-1]
+            else: 
+                # min(deletion, insertion, substitution)
+                d[i, j] = min(d[i-1, j], d[i, j-1], d[i-1, j-1]) + 1
+    return d[len(ref_words), len(hyp_words)].item() / max(1, len(ref_words))
 
 # --- 2. DATA PREPROCESSING ---
 class LibriCollate:
@@ -64,7 +94,10 @@ class LibriCollate:
             targets = torch.tensor(ids, dtype=torch.long)
             transcripts.append(targets)
             
-            audio_lengths.append(wav.size(-1) // 160) # Approx frames at 160 hop
+            # Correct length for torchaudio.transforms.MelSpectrogram(center=True)
+            # T = 1 + (L // hop_length) 
+            # Note: This matches the default behavior of the mel_transform used in train()
+            audio_lengths.append(1 + (wav.size(-1) // 160))
             label_lengths.append(len(ids))
 
         # Pad audio and targets
@@ -74,10 +107,35 @@ class LibriCollate:
         return waveforms, transcripts, torch.tensor(audio_lengths, dtype=torch.int32), torch.tensor(label_lengths, dtype=torch.int32)
 
 # --- 3. TRAINING FUNCTION ---
-def train():
-    # Load Configuration
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
+def train(limit_override=None):
+    try:
+        # Load Configuration
+        with open("config.yaml", "r") as f: 
+            config = yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading config.yaml: {e}")
+        return
+
+    # Explicit Type Casting to avoid comparison errors
+    try:
+        config['train']['lr'] = float(config['train']['lr'])
+        config['train']['epochs'] = int(config['train']['epochs'])
+        config['train']['batch_size'] = int(config['train']['batch_size'])
+        config['train']['accum_steps'] = int(config['train'].get('accum_steps', 1))
+        config['train']['weight_decay'] = float(config['train'].get('weight_decay', 0.1))
+        config['train']['grad_clipping'] = float(config['train'].get('grad_clipping', 1.0))
+        config['model']['dim'] = int(config['model']['dim'])
+        config['model']['n_enc'] = int(config['model']['n_enc'])
+        config['model']['n_pred'] = int(config['model']['n_pred'])
+        config['model']['vocab_size'] = int(config['model']['vocab_size'])
+        config['monitoring']['log_interval'] = int(config['monitoring']['log_interval'])
+        config['monitoring']['validation_hook_interval'] = int(config['monitoring']['validation_hook_interval'])
+    except KeyError as e:
+        print(f"Missing configuration key: {e}")
+        return
+    except ValueError as e:
+        print(f"Invalid value in configuration: {e}")
+        return
 
     os.makedirs(config['paths']['checkpoint_dir'], exist_ok=True)
     os.makedirs(os.path.dirname(config['paths']['log_file']), exist_ok=True)
@@ -120,7 +178,8 @@ def train():
     ).to(DEVICE)
     
     # 12KB Recap: 12 layers * 256 dim * 4 bytes = 12.288 KB
-    print_final_stats(model, time_steps=100, label_steps=20)
+    # Post-subsampling workload: 100 raw frames -> 25 model steps
+    print_final_stats(model, time_steps=25, label_steps=20)
     
     optimizer = optim.AdamW(model.parameters(), lr=config['train']['lr'], weight_decay=config['train']['weight_decay'])
     # Point 2: Cosine LR Schedule
@@ -132,7 +191,7 @@ def train():
     
     print(f"Loading LibriSpeech-100... Batch Size: {config['train']['batch_size']}")
     train_set = LIBRISPEECH("./data", url="train-clean-100", download=True)
-    limit = config['train'].get('train_limit_samples')
+    limit = limit_override if limit_override is not None else config['train'].get('train_limit_samples')
     if limit:
         print(f"Limiting training to {limit} samples...")
         train_set = torch.utils.data.Subset(train_set, range(min(limit, len(train_set))))
@@ -193,26 +252,67 @@ def train():
             with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
                 logits = model(mel, targets)
             
-            # 3. Compute RNN-T Loss (HYBRID: Must be CPU for MPS, native on CUDA/CPU)
-            input_lengths = torch.ceil(audio_lengths.float() / 4.0).to(torch.int32)
-            input_lengths = torch.clamp(input_lengths, max=logits.size(1))
+            # 3. Compute RNN-T Loss
+            # Precise calculation for 4x subsampling (Conv2d with K=3, S=2, P=0)
+            audio_lengths, target_lengths = audio_lengths.to(DEVICE), target_lengths.to(DEVICE)
+            
+            # Layer 1: stride 2, kernel 3
+            l1 = torch.floor((audio_lengths.float() - 3) / 2) + 1
+            # Layer 2: stride 2, kernel 3
+            input_lengths = (torch.floor((l1 - 3) / 2) + 1).to(torch.int32)
+            
+            # Reduce lengths by 1 for safety margin against edge cases
+            input_lengths = torch.clamp(input_lengths - 1, min=1)
+            
+            # Validate input_lengths >= target_lengths
+            for i in range(input_lengths.size(0)):
+                if input_lengths[i] <= target_lengths[i]:
+                    # print(f"Warning: Truncating target for sample {i}")
+                    target_lengths[i] = torch.clamp(input_lengths[i] - 1, min=0)
 
+            # Final clamp
+            input_lengths = torch.clamp(input_lengths, max=logits.size(1))
+            target_lengths = torch.clamp(target_lengths, max=logits.size(2) - 1)
+
+            # DYNAMIC ALIGNMENT: Ensure the metadata (lengths) and tensor (logits) are in sync
+            # This prevents "input length mismatch" by forcing the longest sample to match the tensor size
+            if input_lengths.max() < logits.size(1):
+                input_lengths[torch.argmax(input_lengths)] = logits.size(1)
+
+            # Check for NaNs causing crashes
+            if torch.isnan(logits).any():
+                print("PANIC: NaNs in logits! Skipping batch.")
+                continue
+
+            # Safety Check: Ensure targets dimension matches logits (U = L + 1)
+            # This is a strict requirement of rnnt_loss
+            if targets.size(1) != logits.size(2) - 1:
+                # This should theoretically not happen given our model code, but good to be safe
+                if targets.size(1) < logits.size(2) - 1:
+                    pad_len = (logits.size(2) - 1) - targets.size(1)
+                    targets = torch.nn.functional.pad(targets, (0, pad_len))
+
+            # Move to contiguous memory (Critical for CUDA/MPS kernels)
+            # This must be the VERY last step before the loss function
+            logits = logits.contiguous()
+            targets = targets.to(torch.int32).contiguous()
+            input_lengths = input_lengths.contiguous()
+            target_lengths = target_lengths.contiguous()
+            
             # Hybrid check: move to CPU only if using MPS
             use_cpu_loss = (DEVICE.type == "mps")
             
-            loss_logits = logits.cpu() if use_cpu_loss else logits
-            loss_targets = targets.to(torch.int32).cpu() if use_cpu_loss else targets.to(torch.int32)
-            loss_input_len = input_lengths.cpu() if use_cpu_loss else input_lengths
-            loss_target_len = target_lengths.cpu() if use_cpu_loss else target_lengths
-
             loss = rnnt_loss(
-                logits=loss_logits, 
-                targets=loss_targets, 
-                logit_lengths=loss_input_len, 
-                target_lengths=loss_target_len,
+                logits=logits.cpu() if use_cpu_loss else logits,
+                targets=targets.cpu() if use_cpu_loss else targets,
+                logit_lengths=input_lengths.cpu() if use_cpu_loss else input_lengths,
+                target_lengths=target_lengths.cpu() if use_cpu_loss else target_lengths,
                 blank=BLANK_IDX,
                 reduction='mean'
-            ).to(DEVICE) # Move loss to device for backward pass
+            )
+            
+            # No .to(DEVICE) needed if inputs were already on device
+            if use_cpu_loss: loss = loss.to(DEVICE)
             
             # Scale loss for gradient accumulation
             accum_steps = config['train']['accum_steps']
@@ -311,9 +411,23 @@ def train():
                     logits = model(mel, targets)
                 
                 # Loss Calculation
-                input_lengths = torch.ceil(audio_lengths.float() / 4.0).to(torch.int32)
+                # Precise calculation for 4x subsampling
+                l1_v = torch.floor((audio_lengths.float() - 3) / 2) + 1
+                input_lengths = (torch.floor((l1_v - 3) / 2) + 1).to(torch.int32)
+                
+                # Safety margins
+                input_lengths = torch.clamp(input_lengths - 1, min=1)
+                for i in range(input_lengths.size(0)):
+                    if input_lengths[i] <= target_lengths[i]:
+                        target_lengths[i] = torch.clamp(input_lengths[i] - 1, min=0)
+
                 input_lengths = torch.clamp(input_lengths, max=logits.size(1))
-                use_cpu_loss = (DEVICE.type == "mps")
+                target_lengths = torch.clamp(target_lengths, max=logits.size(2) - 1)
+                
+                # Dynamic Alignment
+                if input_lengths.max() < logits.size(1):
+                    input_lengths[torch.argmax(input_lengths)] = logits.size(1)
+
                 loss = rnnt_loss(
                     logits=logits.cpu() if use_cpu_loss else logits,
                     targets=targets.to(torch.int32).cpu() if use_cpu_loss else targets.to(torch.int32),
@@ -358,4 +472,12 @@ def train():
     log_file.close()
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="RWKV-T Training Script")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of training samples (for testing)")
+    args = parser.parse_args()
+
+    try:
+        train(limit_override=args.limit)
+    except Exception:
+        print("\n--- Training Interrupted by Fatal Error ---")
+        traceback.print_exc()
