@@ -10,8 +10,8 @@ model:
 
 # Training Hyperparameters
 train:
-  batch_size: 1024
-  accum_steps: 1
+  batch_size: 32      # Reduced to 32 to prevent RNN-T lattice OOM
+  accum_steps: 32    # 32 * 32 = 1024 effective batch size
   lr: 1e-4
   epochs: 25
   weight_decay: 0.1
