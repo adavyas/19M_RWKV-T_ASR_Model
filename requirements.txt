@@ -3,3 +3,5 @@ torchaudio
 sentencepiece
 pyyaml
 wandb
+soundfile
+numpy
