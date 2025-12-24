@@ -1,0 +1,34 @@
+# RWKV-T 19M B200 Training Configuration
+
+# Model Architecture
+model:
+  dim: 256
+  n_enc: 12
+  n_pred: 4
+  vocab_size: 2049  # 2048 BPE + 1 blank
+  dropout: 0.1
+
+# Training Hyperparameters
+train:
+  batch_size: 1024
+  accum_steps: 1
+  lr: 1e-4
+  epochs: 25
+  weight_decay: 0.1
+  grad_clipping: 1.0
+  seed: 42
+
+# Metadata & Monitoring
+monitoring:
+  wandb_project: "rwkv-t-asr"
+  log_interval: 10
+  validation_hook_interval: 1000
+  num_validation_samples: 5
+  export_manifest: true
+
+# Path Configuration
+paths:
+  tokenizer_model: "bpe.model"
+  checkpoint_dir: "checkpoints"
+  log_file: "logs/training_log.csv"
+  manifest_file: "logs/experiment_manifest.json"

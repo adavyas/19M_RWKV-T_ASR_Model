@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS Files
+.DS_Store
+
+# Virtual Environment
+env/
+venv/
+.env
+
+# Data
+data/
+SpeechCommands/
+*.tar.gz
+
+# Tokenizer
+bpe.model
+bpe.vocab
+libri_transcripts.txt
+
+# Training Artifacts
+checkpoints/
+logs/
+*.pth
+*.json
+*.csv
+
+# Monitoring/Plots
+*.png
+
+# Utility Scripts (Non-essential for training)
+validate_arch.py
+plot_training.py
