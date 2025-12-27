@@ -10,13 +10,16 @@ model:
 
 # Training Hyperparameters
 train:
-  batch_size: 32      # Reduced to 32 to prevent RNN-T lattice OOM
+  batch_size: 32      # Optimized for B200 (141GB)
   accum_steps: 32    # 32 * 32 = 1024 effective batch size
   lr: 1e-4
   epochs: 25
   weight_decay: 0.1
   grad_clipping: 1.0
   seed: 42
+  num_workers: 12    # High throughput for B200 CPU
+  max_audio_duration: 30.0 # Full LibriSpeech coverage for B200
+  
 
 # Metadata & Monitoring
 monitoring:

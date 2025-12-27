@@ -34,3 +34,5 @@ logs/
 # Utility Scripts (Non-essential for training)
 validate_arch.py
 plot_training.py
+setup_b200.md
+a10.yaml

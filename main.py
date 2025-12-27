@@ -20,6 +20,7 @@ class RWKV7_Block(nn.Module):
         self.ln1 = nn.LayerNorm(dim)
         self.ln2 = nn.LayerNorm(dim)
         self.state_norm = nn.GroupNorm(dim // 32, dim)
+        self.grn = GRN(dim)
         self.dropout = nn.Dropout(dropout)
 
         # Time-Mix (Generalized Delta Rule)
@@ -80,10 +81,12 @@ class RWKV7_Block(nn.Module):
         
         x = x + self.dropout(mixed_out)
         
-        # MLP (Simplified v7 gating)
+        # MLP (Simplified v7 gating) with GRN
         xx = self.ln2(x)
         k_ffn = torch.square(torch.relu(self.ffn_key(xx)))
-        ffn_out = torch.sigmoid(self.ffn_receptance(xx)) * self.ffn_value(k_ffn)
+        # Applying GRN to the bottleneck to increase feature diversity
+        ffn_hidden = self.grn(self.ffn_value(k_ffn))
+        ffn_out = torch.sigmoid(self.ffn_receptance(xx)) * ffn_hidden
         x = x + self.dropout(ffn_out)
         
         return x, state
@@ -141,12 +144,63 @@ class RWKV_Predictor(nn.Module):
         self.ln_in = nn.LayerNorm(dim)
         self.blocks = nn.ModuleList([RWKV7_Block(i, dim, dropout=dropout) for i in range(n_layers)])
 
-    def forward(self, y):
+    def forward(self, y, state=None):
+        """Standard forward (lattice) or single-step (recurrent) inference.
+        y: [B, T] token IDs
+        state: Optional list of states per layer [L, B, D]
+        """
         x = self.embed(y)
         x = self.ln_in(x)
-        for block in self.blocks:
-            x, _ = block(x)
-        return x
+        
+        new_states = []
+        for i, block in enumerate(self.blocks):
+            s = state[i] if state is not None else None
+            x, s = block(x, s)
+            new_states.append(s)
+            
+        return x, new_states
+
+    @torch.no_grad()
+    def greedy_decode(self, enc_out, joiner, blank_idx):
+        """Stateful greedy decoding for RNN-T.
+        Runs in O(U) instead of O(U^2) by carrying the RNN state forward.
+        """
+        batch_size = enc_out.size(0)
+        predictions = []
+
+        for b in range(batch_size):
+            # Start with BOS (which is usually the Blank token in RNN-T)
+            y = torch.full((1, 1), blank_idx, dtype=torch.long, device=enc_out.device)
+            state = None
+            b_enc = enc_out[b:b+1] # [1, T, D]
+            hyp = []
+            
+            # Pre-compute initial predictor output for BOS
+            pred_out, state = self.forward(y, state) # pred_out: [1, 1, D]
+            
+            t = 0
+            max_t = b_enc.size(1)
+            u = 0 # Count tokens per frame
+            max_u_per_t = 5
+            max_hyp_len = 500 # Global safety cap
+            
+            while t < max_t and len(hyp) < max_hyp_len:
+                # Join current frame t and current predictor state
+                logits = joiner(b_enc[:, t:t+1, :], pred_out[:, -1:, :])
+                token = torch.argmax(logits, dim=-1).item()
+                
+                if token == blank_idx or u >= max_u_per_t:
+                    t += 1
+                    u = 0
+                else:
+                    hyp.append(token)
+                    u += 1
+                    # For the next predictor step, we only need the single new token
+                    y = torch.tensor([[token]], device=enc_out.device)
+                    pred_out, state = self.forward(y, state)
+            
+            predictions.append(hyp)
+        return predictions
 
 class Transducer_Joiner(nn.Module):
     def __init__(self, dim, vocab_size, dropout=0.1):
@@ -175,55 +229,47 @@ class RWKV_Transducer(nn.Module):
     # Vocab is 2048 BPE pieces + 1 for <blank> at index 2048
     def __init__(self, vocab_size=2049, dim=256, n_enc=12, n_pred=4, dropout=0.1):
         super().__init__()
+        self.vocab_size = vocab_size
+        self.blank_idx = vocab_size - 1
         self.encoder = RWKV_Encoder(dim, n_enc, dropout=dropout)
-        # Predictor only embeds actual tokens (vocab_size - 1), blank is not a text input
+        # Predictor handles actual tokens; blank usually acts as BOS
         self.predictor = RWKV_Predictor(vocab_size, dim, n_pred, dropout=dropout)
         self.joiner = Transducer_Joiner(dim, vocab_size, dropout=dropout)
 
     def forward(self, audio, labels):
         enc_out = self.encoder(audio)
         
-        # Prepend a blank token (index 0) for the predictor BOS
+        # Prepend a blank token (BOS) for the predictor history
         batch_size = labels.size(0)
-        bos_token = torch.zeros((batch_size, 1), dtype=labels.dtype, device=labels.device)
+        bos_token = torch.full((batch_size, 1), self.blank_idx, dtype=labels.dtype, device=labels.device)
         bos_labels = torch.cat([bos_token, labels], dim=1)
         
-        pred_out = self.predictor(bos_labels)
+        pred_out, _ = self.predictor(bos_labels)
         return self.joiner(enc_out, pred_out)
 
     @torch.no_grad()
     def greedy_decode(self, audio):
-        """Simplified greedy decoding for Keyword Spotting"""
         self.eval()
-        enc_out = self.encoder(audio) # [B, T, D]
-        batch_size = audio.size(0)
-        predictions = []
+        enc_out = self.encoder(audio)
+        return self.predictor.greedy_decode(enc_out, self.joiner, self.blank_idx)
 
-        for b in range(batch_size):
-            # [1, 1] starting with <blank>
-            y = torch.zeros((1, 1), dtype=torch.long, device=audio.device)
-            b_enc = enc_out[b:b+1] # [1, T, D]
-            hyp = []
-            
-            t = 0
-            max_t = b_enc.size(1)
-            while t < max_t:
-                # Predictor output for current history y
-                pred_out = self.predictor(y) # [1, len(y), D]
-                
-                # Join current frame t and last predicted state u
-                # enc_out: [1, 1, D], pred_out: [1, 1, D] -> logits: [1, 1, 1, V]
-                logits = self.joiner(b_enc[:, t:t+1, :], pred_out[:, -1:, :])
-                token = torch.argmax(logits, dim=-1).item()
-                
-                if token == 0: # <blank> means move to next audio frame
-                    t += 1
-                else: # Predicted a word piece
-                    hyp.append(token)
-                    y = torch.cat([y, torch.tensor([[token]], device=audio.device)], dim=1)
-            
-            predictions.append(hyp)
-        return predictions
+class GRN(nn.Module):
+    """Global Response Normalization (from ConvNeXt v2)
+    Encourages feature competition and diversity across channels.
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, 1, dim))
+        self.beta = nn.Parameter(torch.zeros(1, 1, dim))
+
+    def forward(self, x):
+        # x: [B, T, D]
+        # 1. Global feature magnitude
+        gx = torch.norm(x, p=2, dim=1, keepdim=True) # [B, 1, D]
+        # 2. Divide by mean to get relative response
+        nx = gx / (gx.mean(dim=-1, keepdim=True) + 1e-6)
+        # 3. Scale and residual
+        return self.gamma * (x * nx) + self.beta + x
 
 # --- 3. HELPER FUNCTIONS ---
 def estimate_flops(model, batch_size, time_steps, label_steps, is_training=False):
@@ -282,6 +328,10 @@ if __name__ == "__main__":
     
     logits = model(audio, labels)
     print(f"Lattice Shape: {logits.shape}")
+
+    # Test greedy decoding
+    preds = model.greedy_decode(audio)
+    print(f"Greedy Decode Sample: {preds[0]}")
 
     # Compute and print stats
     print_final_stats(model, time_steps=25, label_steps=20) # 25 frames after 4x subsampling
