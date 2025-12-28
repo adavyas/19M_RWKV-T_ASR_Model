@@ -181,13 +181,13 @@ def train(limit_override=None):
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['train']['epochs'])
     
-    # --- TORCH COMPILE (Disabled temporarily to debug CUDA Illegal Access) ---
-    # if hasattr(torch, "compile") and DEVICE.type == 'cuda':
-    #     print("Enabling torch.compile() for RWKV kernels...", flush=True)
-    #     try:
-    #         model = torch.compile(model)
-    #     except Exception as e:
-    #         print(f"torch.compile failed: {e}")
+    # --- TORCH COMPILE (The B200 Supercharger) ---
+    if hasattr(torch, "compile") and DEVICE.type == 'cuda':
+        print("Enabling torch.compile() for RWKV kernels...", flush=True)
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            print(f"torch.compile failed, falling back to eager: {e}")
 
     print_final_stats(model, time_steps=25, label_steps=20)
     
@@ -346,24 +346,23 @@ def train(limit_override=None):
                 if input_lengths[b_idx] <= target_lengths[b_idx]:
                     input_lengths[b_idx] = torch.clamp(target_lengths[b_idx] + 1, max=max_t)
 
-            # --- TOTAL STABILITY LOSS CALL ---
-            use_cpu_loss_safety = True 
-            torch.cuda.synchronize() # Final sync before CPU transfer
+            # --- PERFORMANCE GPU LOSS CALL ---
+            torch.cuda.synchronize() # Ensure forward pass is complete
             
-            # Explicitly move to CPU and ensure contiguity to prevent segfaults
-            cpu_logits = logits.float().cpu().contiguous()
-            cpu_targets = targets.to(torch.int32).cpu().contiguous()
-            cpu_logit_lengths = input_lengths.cpu().contiguous()
-            cpu_target_lengths = target_lengths.cpu().contiguous()
+            # Explicitly ensure contiguity and float32 for RNN-T kernel stability
+            # Tensors stay on GPU (DEVICE)
+            gpu_logits = logits.float().contiguous()
+            gpu_targets = targets.to(torch.int32).contiguous()
+            gpu_logit_lengths = input_lengths.to(DEVICE).contiguous()
+            gpu_target_lengths = target_lengths.to(DEVICE).contiguous()
 
             loss = rnnt_loss(
-                logits=cpu_logits,
-                targets=cpu_targets,
-                logit_lengths=cpu_logit_lengths,
-                target_lengths=cpu_target_lengths,
+                logits=gpu_logits,
+                targets=gpu_targets,
+                logit_lengths=gpu_logit_lengths,
+                target_lengths=gpu_target_lengths,
                 blank=BLANK_IDX, reduction='mean'
             )
-            if use_cpu_loss_safety: loss = loss.to(DEVICE)
             
             accum_steps = config['train']['accum_steps']
             scaler.scale(loss / accum_steps).backward()
