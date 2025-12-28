@@ -10,7 +10,7 @@ model:
 
 # Training Hyperparameters
 train:
-  batch_size: 32      # Optimized for B200 (141GB)
+  batch_size: 2      # Optimized for B200 (141GB)
   accum_steps: 32    # 32 * 32 = 1024 effective batch size
   lr: 1e-4
   epochs: 25

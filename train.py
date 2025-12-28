@@ -314,39 +314,53 @@ def train(limit_override=None):
             snr = torch.randint(10, 30, (waveforms.size(0),)).to(DEVICE)
             waveforms = torchaudio.functional.add_noise(waveforms, noise, snr.unsqueeze(1))
 
+            # --- FORCED B200 STABILITY OVERRIDES ---
+            torch.cuda.synchronize() 
+            torch.cuda.empty_cache()
+            
             dtype = torch.bfloat16 if (DEVICE.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
             with torch.amp.autocast(device_type=DEVICE.type, dtype=dtype, enabled=use_amp):
                 mel = mel_transform(waveforms).squeeze(1)
                 mel = spec_norm(mel)
                 logits = model(mel, targets)
+                
+                # --- PHASE 2: LOGIT CAPPING (Prevent numerical overflow) ---
+                logits = torch.clamp(logits, min=-10.0, max=10.0)
+            
+            # --- DIAGNOSTIC LOGGING (First Batch Only) ---
+            if batch_idx == 0 and epoch == start_epoch:
+                print(f"DEBUG: Logits shape: {logits.shape}, dtype: {logits.dtype}, device: {logits.device}")
+                print(f"DEBUG: Targets shape: {targets.shape}, dtype: {targets.dtype}, device: {targets.device}")
+                if torch.isnan(logits).any():
+                    print("CRITICAL: Logits contain NaNs! Model is unstable.")
             
             # --- SAFE DYNAMIC LENGTH CALCULATION ---
-            # Input lengths: We calculate the relative length based on the raw audio and apply it 
-            # to the actual logits T dimension to avoid off-by-one CUDA errors.
             max_t = logits.size(1)
             max_u = logits.size(2)
-            
-            # audio_lengths contains samples. 
-            # We know the encoder output length is T_logits. 
-            # We scale the relative length of each audio sample to the T_logits space.
             batch_max_samples = audio_lengths.max().float()
             input_lengths = torch.ceil((audio_lengths.float() / batch_max_samples) * max_t).to(torch.int32)
             input_lengths = torch.clamp(input_lengths, min=1, max=max_t)
-            
-            # Target lengths: Must be at most U-1 since the loss looks at (u, u+1)
             target_lengths = torch.clamp(target_lengths, min=0, max=max_u - 1)
 
-            # Extra Safety: RNN-T requires T > U-1 for the path to be valid
             for b_idx in range(input_lengths.size(0)):
                 if input_lengths[b_idx] <= target_lengths[b_idx]:
                     input_lengths[b_idx] = torch.clamp(target_lengths[b_idx] + 1, max=max_t)
 
-            use_cpu_loss_safety = True # Force CPU loss for B200 stability debugging
+            # --- TOTAL STABILITY LOSS CALL ---
+            use_cpu_loss_safety = True 
+            torch.cuda.synchronize() # Final sync before CPU transfer
+            
+            # Explicitly move to CPU and ensure contiguity to prevent segfaults
+            cpu_logits = logits.float().cpu().contiguous()
+            cpu_targets = targets.to(torch.int32).cpu().contiguous()
+            cpu_logit_lengths = input_lengths.cpu().contiguous()
+            cpu_target_lengths = target_lengths.cpu().contiguous()
+
             loss = rnnt_loss(
-                logits=logits.float().cpu() if use_cpu_loss_safety else logits.float(),
-                targets=targets.to(torch.int32).cpu() if use_cpu_loss_safety else targets.to(torch.int32),
-                logit_lengths=input_lengths.cpu() if use_cpu_loss_safety else input_lengths,
-                target_lengths=target_lengths.cpu() if use_cpu_loss_safety else target_lengths,
+                logits=cpu_logits,
+                targets=cpu_targets,
+                logit_lengths=cpu_logit_lengths,
+                target_lengths=cpu_target_lengths,
                 blank=BLANK_IDX, reduction='mean'
             )
             if use_cpu_loss_safety: loss = loss.to(DEVICE)
