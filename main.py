@@ -235,6 +235,8 @@ class RWKV_Transducer(nn.Module):
         # Predictor handles actual tokens; blank usually acts as BOS
         self.predictor = RWKV_Predictor(vocab_size, dim, n_pred, dropout=dropout)
         self.joiner = Transducer_Joiner(dim, vocab_size, dropout=dropout)
+        # CTC head for Blackwell stability pivot
+        self.ctc_head = nn.Linear(dim, vocab_size)
 
     def forward(self, audio, labels):
         enc_out = self.encoder(audio)
@@ -247,11 +249,34 @@ class RWKV_Transducer(nn.Module):
         pred_out, _ = self.predictor(bos_labels)
         return self.joiner(enc_out, pred_out)
 
+    def forward_ctc(self, audio):
+        enc_out = self.encoder(audio)
+        return self.ctc_head(enc_out)
+
     @torch.no_grad()
     def greedy_decode(self, audio):
         self.eval()
         enc_out = self.encoder(audio)
         return self.predictor.greedy_decode(enc_out, self.joiner, self.blank_idx)
+
+    @torch.no_grad()
+    def greedy_decode_ctc(self, audio):
+        self.eval()
+        logits = self.forward_ctc(audio) # [B, T, C]
+        probs = F.softmax(logits, dim=-1)
+        best_path = torch.argmax(probs, dim=-1) # [B, T]
+        
+        predictions = []
+        for b in range(best_path.size(0)):
+            hyp = []
+            prev = None
+            for token in best_path[b]:
+                token = token.item()
+                if token != self.blank_idx and token != prev:
+                    hyp.append(token)
+                prev = token
+            predictions.append(hyp)
+        return predictions
 
 class GRN(nn.Module):
     """Global Response Normalization (from ConvNeXt v2)

@@ -319,48 +319,33 @@ def train(limit_override=None):
             torch.cuda.empty_cache()
             
             dtype = torch.bfloat16 if (DEVICE.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
+            # --- PERFORMANCE CTC LOSS PIVOT ---
+            # Forward pass using CTC head
             with torch.amp.autocast(device_type=DEVICE.type, dtype=dtype, enabled=use_amp):
-                mel = mel_transform(waveforms).squeeze(1)
-                mel = spec_norm(mel)
-                logits = model(mel, targets)
-                
-                # --- PHASE 2: LOGIT CAPPING (Prevent numerical overflow) ---
+                logits = model.forward_ctc(mel) # [B, T, C]
                 logits = torch.clamp(logits, min=-10.0, max=10.0)
             
             # --- DIAGNOSTIC LOGGING (First Batch Only) ---
             if batch_idx == 0 and epoch == start_epoch:
-                print(f"DEBUG: Logits shape: {logits.shape}, dtype: {logits.dtype}, device: {logits.device}")
+                print(f"DEBUG: CTC Logits shape: {logits.shape}, dtype: {logits.dtype}, device: {logits.device}")
                 print(f"DEBUG: Targets shape: {targets.shape}, dtype: {targets.dtype}, device: {targets.device}")
-                if torch.isnan(logits).any():
-                    print("CRITICAL: Logits contain NaNs! Model is unstable.")
-            
-            # --- SAFE DYNAMIC LENGTH CALCULATION ---
+
+            # Safe Length Calculation for CTC
             max_t = logits.size(1)
-            max_u = logits.size(2)
             batch_max_samples = audio_lengths.max().float()
             input_lengths = torch.ceil((audio_lengths.float() / batch_max_samples) * max_t).to(torch.int32)
             input_lengths = torch.clamp(input_lengths, min=1, max=max_t)
-            target_lengths = torch.clamp(target_lengths, min=0, max=max_u - 1)
-
-            for b_idx in range(input_lengths.size(0)):
-                if input_lengths[b_idx] <= target_lengths[b_idx]:
-                    input_lengths[b_idx] = torch.clamp(target_lengths[b_idx] + 1, max=max_t)
-
-            # --- PERFORMANCE GPU LOSS CALL ---
-            torch.cuda.synchronize() # Ensure forward pass is complete
             
-            # Explicitly ensure contiguity and float32 for RNN-T kernel stability
-            # Tensors stay on GPU (DEVICE)
-            gpu_logits = logits.float().contiguous()
-            gpu_targets = targets.to(torch.int32).contiguous()
-            gpu_logit_lengths = input_lengths.to(DEVICE).contiguous()
-            gpu_target_lengths = target_lengths.to(DEVICE).contiguous()
-
-            loss = rnnt_loss(
-                logits=gpu_logits,
-                targets=gpu_targets,
-                logit_lengths=gpu_logit_lengths,
-                target_lengths=gpu_target_lengths,
+            # CTC expects log_probs as [T, N, C]
+            log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1) # [T, B, C]
+            
+            # Performance GPU CTC Loss
+            torch.cuda.synchronize()
+            loss = torchaudio.functional.ctc_loss(
+                log_probs=log_probs,
+                targets=targets.to(torch.int32),
+                input_lengths=input_lengths.to(DEVICE),
+                target_lengths=target_lengths.to(DEVICE),
                 blank=BLANK_IDX, reduction='mean'
             )
             
@@ -404,7 +389,7 @@ def train(limit_override=None):
                 with torch.no_grad():
                     # Autocast needed here too for the encoder pass
                     with torch.amp.autocast(device_type=DEVICE.type, dtype=dtype, enabled=use_amp):
-                        preds = model.greedy_decode(mel[:peek_num])
+                        preds = model.greedy_decode_ctc(mel[:peek_num])
                     
                     for i in range(peek_num):
                         ref = tokenizer.decode_ids(targets[i, :target_lengths[i]].tolist())
