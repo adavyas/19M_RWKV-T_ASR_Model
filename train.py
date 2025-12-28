@@ -307,6 +307,7 @@ def train(limit_override=None):
             step_start = time.time()
             # non_blocking=True overlaps transfer with next batch loading
             waveforms, targets = waveforms.to(DEVICE, non_blocking=True), targets.to(DEVICE, non_blocking=True)
+            audio_lengths, target_lengths = audio_lengths.to(DEVICE, non_blocking=True), target_lengths.to(DEVICE, non_blocking=True)
             
             # Simple Augment: White Noise
             noise = torch.randn_like(waveforms) * 0.01
