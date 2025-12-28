@@ -6,3 +6,5 @@ wandb
 soundfile
 numpy
 weave
+warp-rnnt
+torchcodec

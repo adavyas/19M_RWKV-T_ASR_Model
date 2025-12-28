@@ -5,7 +5,15 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import torchaudio
 from torchaudio.datasets import LIBRISPEECH
-from torchaudio.functional import rnnt_loss
+# Try warp-rnnt first, fall back to torchaudio if not available
+try:
+    from warp_rnnt import rnnt_loss as warp_rnnt_loss
+    USE_WARP_RNNT = True
+    print("Using warp-rnnt for RNN-T loss")
+except ImportError:
+    from torchaudio.functional import rnnt_loss
+    USE_WARP_RNNT = False
+    print("warp-rnnt not available, using torchaudio.rnnt_loss")
 import os
 import sentencepiece as spm
 import yaml
@@ -329,42 +337,66 @@ def train(limit_override=None):
             waveforms = torchaudio.functional.add_noise(waveforms, noise, snr.unsqueeze(1))
 
             dtype = torch.bfloat16 if (DEVICE.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
-            # --- PERFORMANCE CTC LOSS ---
-            with torch.amp.autocast(device_type=DEVICE.type, dtype=dtype, enabled=use_amp):
-                mel = mel_transform(waveforms).squeeze(1)
-                mel = spec_norm(mel)
-                logits = model.forward_ctc(mel) # [B, T, C]
-                logits = torch.clamp(logits, min=-10.0, max=10.0)
             
-            # --- DIAGNOSTIC LOGGING (First Batch Only) ---
-            if batch_idx == 0 and epoch == start_epoch:
-                print(f"DEBUG: CTC Logits shape: {logits.shape}, dtype: {logits.dtype}, device: {logits.device}")
-                print(f"DEBUG: Targets shape: {targets.shape}, dtype: {targets.dtype}, device: {targets.device}")
-                print(f"DEBUG: BLANK_IDX = {BLANK_IDX}")
-                # Check what the model is actually predicting
-                with torch.no_grad():
-                    preds = torch.argmax(logits[0], dim=-1)
-                    unique_tokens = torch.unique(preds)
-                    print(f"DEBUG: Unique predicted tokens: {unique_tokens.tolist()}")
-                    print(f"DEBUG: Target tokens (first sample): {targets[0, :target_lengths[0]].tolist()[:20]}")
-
-            # Safe Length Calculation for CTC
-            max_t = logits.size(1)
-            batch_max_samples = audio_lengths.max().float()
-            input_lengths = torch.ceil((audio_lengths.float() / batch_max_samples) * max_t).to(torch.int32)
-            input_lengths = torch.clamp(input_lengths, min=1, max=max_t)
-            
-            # CTC expects log_probs as [T, N, C]
-            log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1) # [T, B, C]
-            
-            # Performance GPU CTC Loss
-            loss = F.ctc_loss(
-                log_probs=log_probs.float(), # CTC requires float32 log probs
-                targets=targets.to(torch.int32),
-                input_lengths=input_lengths.to(DEVICE),
-                target_lengths=target_lengths.to(DEVICE),
-                blank=BLANK_IDX, reduction='mean'
-            )
+            # --- WARP-RNNT VS CTC LOSS ---
+            if USE_WARP_RNNT:
+                # Full Transducer forward (encoder + predictor + joiner)
+                with torch.amp.autocast(device_type=DEVICE.type, dtype=dtype, enabled=use_amp):
+                    mel = mel_transform(waveforms).squeeze(1)
+                    mel = spec_norm(mel)
+                    logits = model(mel, targets)  # [B, T, U+1, V]
+                
+                # --- DIAGNOSTIC LOGGING (First Batch Only) ---
+                if batch_idx == 0 and epoch == start_epoch:
+                    print(f"DEBUG: RNN-T Logits shape: {logits.shape}, dtype: {logits.dtype}, device: {logits.device}")
+                    print(f"DEBUG: Targets shape: {targets.shape}, dtype: {targets.dtype}, device: {targets.device}")
+                
+                # Safe Length Calculation for RNN-T
+                max_t = logits.size(1)
+                max_u = logits.size(2)
+                batch_max_samples = audio_lengths.max().float()
+                input_lengths = torch.ceil((audio_lengths.float() / batch_max_samples) * max_t).to(torch.int32)
+                input_lengths = torch.clamp(input_lengths, min=1, max=max_t)
+                target_lengths = torch.clamp(target_lengths, min=0, max=max_u - 1)
+                
+                # Ensure input_lengths > target_lengths for RNN-T
+                for b_idx in range(input_lengths.size(0)):
+                    if input_lengths[b_idx] <= target_lengths[b_idx]:
+                        input_lengths[b_idx] = torch.clamp(target_lengths[b_idx] + 1, max=max_t)
+                
+                # warp-rnnt expects: log_probs [B, T, U, V], CPU lengths
+                log_probs = F.log_softmax(logits.float(), dim=-1)
+                loss = warp_rnnt_loss(
+                    log_probs,
+                    targets.to(torch.int32),
+                    input_lengths.cpu(),
+                    target_lengths.cpu(),
+                    blank=BLANK_IDX, reduction='mean'
+                )
+            else:
+                # Fallback to CTC
+                with torch.amp.autocast(device_type=DEVICE.type, dtype=dtype, enabled=use_amp):
+                    mel = mel_transform(waveforms).squeeze(1)
+                    mel = spec_norm(mel)
+                    logits = model.forward_ctc(mel)
+                    logits = torch.clamp(logits, min=-10.0, max=10.0)
+                
+                if batch_idx == 0 and epoch == start_epoch:
+                    print(f"DEBUG: CTC Logits shape: {logits.shape}")
+                
+                max_t = logits.size(1)
+                batch_max_samples = audio_lengths.max().float()
+                input_lengths = torch.ceil((audio_lengths.float() / batch_max_samples) * max_t).to(torch.int32)
+                input_lengths = torch.clamp(input_lengths, min=1, max=max_t)
+                
+                log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
+                loss = F.ctc_loss(
+                    log_probs=log_probs.float(),
+                    targets=targets.to(torch.int32),
+                    input_lengths=input_lengths.to(DEVICE),
+                    target_lengths=target_lengths.to(DEVICE),
+                    blank=BLANK_IDX, reduction='mean'
+                )
             
             accum_steps = config['train']['accum_steps']
             scaler.scale(loss / accum_steps).backward()
