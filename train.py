@@ -403,7 +403,10 @@ def train(limit_override=None):
                 model.eval()
                 peek_num = min(2, waveforms.size(0))
                 with torch.no_grad():
-                    preds = model.greedy_decode(mel[:peek_num])
+                    # Autocast needed here too for the encoder pass
+                    with torch.amp.autocast(device_type=DEVICE.type, dtype=dtype, enabled=use_amp):
+                        preds = model.greedy_decode(mel[:peek_num])
+                    
                     for i in range(peek_num):
                         ref = tokenizer.decode_ids(targets[i, :target_lengths[i]].tolist())
                         hyp = tokenizer.decode_ids(preds[i])
