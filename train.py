@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torchaudio
@@ -322,6 +323,8 @@ def train(limit_override=None):
             # --- PERFORMANCE CTC LOSS PIVOT ---
             # Forward pass using CTC head
             with torch.amp.autocast(device_type=DEVICE.type, dtype=dtype, enabled=use_amp):
+                mel = mel_transform(waveforms).squeeze(1)
+                mel = spec_norm(mel)
                 logits = model.forward_ctc(mel) # [B, T, C]
                 logits = torch.clamp(logits, min=-10.0, max=10.0)
             
@@ -341,8 +344,8 @@ def train(limit_override=None):
             
             # Performance GPU CTC Loss
             torch.cuda.synchronize()
-            loss = torchaudio.functional.ctc_loss(
-                log_probs=log_probs,
+            loss = F.ctc_loss(
+                log_probs=log_probs.float(), # CTC requires float32 log probs
                 targets=targets.to(torch.int32),
                 input_lengths=input_lengths.to(DEVICE),
                 target_lengths=target_lengths.to(DEVICE),
