@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # --- 1. THE RWKV-7 CORE BLOCK (GOOSE) ---
-@torch.jit.script
+# @torch.jit.script (Disabled for B200 stability debugging)
 def rwkv7_recurrence(r, k, v, a, b, g, w, state):
     out_list = []
     for t in range(r.size(1)):

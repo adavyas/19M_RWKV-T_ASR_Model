@@ -341,13 +341,15 @@ def train(limit_override=None):
                 if input_lengths[b_idx] <= target_lengths[b_idx]:
                     input_lengths[b_idx] = torch.clamp(target_lengths[b_idx] + 1, max=max_t)
 
+            use_cpu_loss_safety = True # Force CPU loss for B200 stability debugging
             loss = rnnt_loss(
-                logits=logits.float(),
-                targets=targets.to(torch.int32),
-                logit_lengths=input_lengths,
-                target_lengths=target_lengths,
+                logits=logits.float().cpu() if use_cpu_loss_safety else logits.float(),
+                targets=targets.to(torch.int32).cpu() if use_cpu_loss_safety else targets.to(torch.int32),
+                logit_lengths=input_lengths.cpu() if use_cpu_loss_safety else input_lengths,
+                target_lengths=target_lengths.cpu() if use_cpu_loss_safety else target_lengths,
                 blank=BLANK_IDX, reduction='mean'
             )
+            if use_cpu_loss_safety: loss = loss.to(DEVICE)
             
             accum_steps = config['train']['accum_steps']
             scaler.scale(loss / accum_steps).backward()
