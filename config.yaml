@@ -11,10 +11,10 @@ model:
 # Training Hyperparameters
 train:
   batch_size: 32
-  accum_steps: 32    # 32 * 32 = 1024 effective batch size
-  lr: 1e-4
+  accum_steps: 4     # Faster updates for initial convergence
+  lr: 1e-3            # Higher LR to escape blank collapse
   epochs: 25
-  weight_decay: 0.1
+  weight_decay: 0.01 # Lower regularization for ASR
   grad_clipping: 1.0
   seed: 42
   num_workers: 12    # High throughput for B200 CPU

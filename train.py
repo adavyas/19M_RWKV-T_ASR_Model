@@ -182,6 +182,10 @@ def train(limit_override=None):
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['train']['epochs'])
     
+    # --- LR WARMUP SCHEDULER ---
+    warmup_steps = 200
+    warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+    
     # --- TORCH COMPILE (The B200 Supercharger) ---
     if hasattr(torch, "compile") and DEVICE.type == 'cuda':
         print("Enabling torch.compile() for RWKV kernels...", flush=True)
@@ -293,8 +297,17 @@ def train(limit_override=None):
     limit = limit_override if limit_override is not None else config['train'].get('train_limit_samples')
     if limit: train_set = torch.utils.data.Subset(train_set, range(min(limit, len(train_set))))
 
-    train_loader = DataLoader(train_set, batch_size=config['train']['batch_size'], shuffle=True, collate_fn=collate_fn, num_workers=num_workers, pin_memory=True)
-    val_set = LIBRISPEECH("./data", url="dev-clean", download=True) # dev-clean acts as validation. train-clean-100 is used for training.
+    train_loader = DataLoader(
+        train_set, 
+        batch_size=config['train']['batch_size'], 
+        shuffle=True, 
+        collate_fn=collate_fn, 
+        num_workers=num_workers, 
+        pin_memory=True,
+        prefetch_factor=4,        # Pre-load 4 batches per worker to hide NFS latency
+        persistent_workers=True   # Keep workers alive between batches
+    )
+    val_set = LIBRISPEECH("./data", url="dev-clean", download=True)
     val_loader = DataLoader(val_set, batch_size=config['train']['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=num_workers)
 
     BLANK_IDX = vocab_size - 1 
@@ -315,13 +328,8 @@ def train(limit_override=None):
             snr = torch.randint(10, 30, (waveforms.size(0),)).to(DEVICE)
             waveforms = torchaudio.functional.add_noise(waveforms, noise, snr.unsqueeze(1))
 
-            # --- FORCED B200 STABILITY OVERRIDES ---
-            torch.cuda.synchronize() 
-            torch.cuda.empty_cache()
-            
             dtype = torch.bfloat16 if (DEVICE.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
-            # --- PERFORMANCE CTC LOSS PIVOT ---
-            # Forward pass using CTC head
+            # --- PERFORMANCE CTC LOSS ---
             with torch.amp.autocast(device_type=DEVICE.type, dtype=dtype, enabled=use_amp):
                 mel = mel_transform(waveforms).squeeze(1)
                 mel = spec_norm(mel)
@@ -332,6 +340,13 @@ def train(limit_override=None):
             if batch_idx == 0 and epoch == start_epoch:
                 print(f"DEBUG: CTC Logits shape: {logits.shape}, dtype: {logits.dtype}, device: {logits.device}")
                 print(f"DEBUG: Targets shape: {targets.shape}, dtype: {targets.dtype}, device: {targets.device}")
+                print(f"DEBUG: BLANK_IDX = {BLANK_IDX}")
+                # Check what the model is actually predicting
+                with torch.no_grad():
+                    preds = torch.argmax(logits[0], dim=-1)
+                    unique_tokens = torch.unique(preds)
+                    print(f"DEBUG: Unique predicted tokens: {unique_tokens.tolist()}")
+                    print(f"DEBUG: Target tokens (first sample): {targets[0, :target_lengths[0]].tolist()[:20]}")
 
             # Safe Length Calculation for CTC
             max_t = logits.size(1)
@@ -343,7 +358,6 @@ def train(limit_override=None):
             log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1) # [T, B, C]
             
             # Performance GPU CTC Loss
-            torch.cuda.synchronize()
             loss = F.ctc_loss(
                 log_probs=log_probs.float(), # CTC requires float32 log probs
                 targets=targets.to(torch.int32),
@@ -362,6 +376,10 @@ def train(limit_override=None):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                
+                # Warmup scheduler step (first 200 optimizer steps)
+                if total_steps < warmup_steps:
+                    warmup_scheduler.step()
 
             epoch_loss += loss.item()
             total_steps += 1
