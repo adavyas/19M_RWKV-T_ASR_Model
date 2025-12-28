@@ -22,12 +22,13 @@ from main import RWKV_Transducer, print_final_stats
 # --- 1. ENVIRONMENT SETUP ---
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["TORCH_USE_CUDA_DSA"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1" # Provides better tracebacks for memory errors
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Executing on device: {DEVICE}")
 
 # --- FIX: Force stable audio backend to avoid torchcodec bug on Lambda/B200 ---
 try:
+    print(f"Torchaudio version: {torchaudio.__version__}")
     if hasattr(torchaudio, "list_audio_backends"):
         backends = torchaudio.list_audio_backends()
     elif hasattr(torchaudio, "utils") and hasattr(torchaudio.utils, "list_audio_backends"):
@@ -168,17 +169,25 @@ def train(limit_override=None):
         weight_decay=config['train']['weight_decay'],
         foreach=True # Significant speedup on B200
     )
-    scaler = torch.amp.GradScaler(device_type=DEVICE.type, enabled=(DEVICE.type != 'cpu'))
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['train']['epochs'])
     use_amp = (DEVICE.type != 'cpu')
+
+    # --- COMPATIBLE GRADSCALER ---
+    if DEVICE.type == 'cuda':
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    elif hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler(enabled=use_amp)
+    else:
+        scaler = None # No scaler available/needed
     
-    # --- TORCH COMPILE (The B200 Supercharger) ---
-    if hasattr(torch, "compile") and DEVICE.type == 'cuda':
-        print("Enabling torch.compile() for RWKV kernels...", flush=True)
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            print(f"torch.compile failed, falling back to eager: {e}")
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['train']['epochs'])
+    
+    # --- TORCH COMPILE (Disabled temporarily to debug CUDA Illegal Access) ---
+    # if hasattr(torch, "compile") and DEVICE.type == 'cuda':
+    #     print("Enabling torch.compile() for RWKV kernels...", flush=True)
+    #     try:
+    #         model = torch.compile(model)
+    #     except Exception as e:
+    #         print(f"torch.compile failed: {e}")
 
     print_final_stats(model, time_steps=25, label_steps=20)
     
@@ -197,26 +206,88 @@ def train(limit_override=None):
     max_duration = config['train'].get('max_audio_duration', 15.0)
     max_samples = int(max_duration * 16000)
 
-    print(f"Loading LibriSpeech-100... Batch Size: {config['train']['batch_size']}", flush=True)
+    print(f"Loading LibriSpeech-100 from {os.path.abspath('./data')}...", flush=True)
     train_set = LIBRISPEECH("./data", url="train-clean-100", download=True)
     
+    raw_count = len(train_set)
+    print(f"Dataset initialized. Found {raw_count} raw samples.", flush=True)
+    
+    if raw_count == 0:
+        print("ERROR: Dataset is empty! please check if data/LibriSpeech/train-clean-100 exists and contains .flac files.")
+        return
+
     # --- WORKER-POWERED FILTERING ---
     print(f"Filtering samples > {max_duration}s using {num_workers} workers...", flush=True)
+    
+    # --- SMART PATH DISCOVERY ---
+    sample_rel = train_set._walker[0]
+    s_id, c_id, _ = sample_rel.split("-")
+    
+    # Check common patterns
+    found_root = None
+    candidates = [
+        os.path.join("./data", "LibriSpeech", "train-clean-100"),
+        os.path.join("./data", "train-clean-100"),
+        os.path.join("./data", "LibriSpeech"),
+        "./data"
+    ]
+    
+    for cand in candidates:
+        test_path = os.path.join(cand, s_id, c_id, f"{sample_rel}.flac")
+        if os.path.exists(test_path):
+            found_root = cand
+            print(f"Path Discovery: Found data at {found_root}", flush=True)
+            break
+            
+    if not found_root:
+        print("ERROR: Could not locate .flac files. Please check your data directory structure.")
+        return
+
+    first_error = None
+    
     def check_length(idx):
+        nonlocal first_error
         try:
-            # Construct path manually for Speed (don't load waveform)
             rel_path = train_set._walker[idx]
-            speaker_id, chapter_id, utterance_id = rel_path.split("-")
-            full_path = os.path.join(train_set._path, "LibriSpeech", train_set._url, speaker_id, chapter_id, f"{rel_path}.flac")
-            info = torchaudio.info(full_path)
+            speaker_id, chapter_id, _ = rel_path.split("-")
+            full_path = os.path.join(found_root, speaker_id, chapter_id, f"{rel_path}.flac")
+            
+            if not os.path.exists(full_path):
+                if first_error is None: first_error = f"File not found: {full_path}"
+                return None
+            
+            # Try multiple ways to get info
+            if hasattr(torchaudio, "info"):
+                info = torchaudio.info(full_path)
+            elif hasattr(torchaudio, "backend") and hasattr(torchaudio.backend, "common"):
+                # Fallback for very old internal structures
+                info = torchaudio.backend.common.AudioMetaData(full_path)
+            else:
+                # If we truly can't get info, just keep the file (don't filter)
+                return idx
+                
             return idx if info.num_frames < max_samples else None
-        except: return None
+        except Exception as e:
+            if first_error is None: first_error = f"torchaudio.info failed on {rel_path}: {e}"
+            return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        results = list(executor.map(check_length, range(len(train_set))))
+        results = list(executor.map(check_length, range(raw_count)))
+    
     valid_indices = [r for r in results if r is not None]
+    print(f"Filter complete: {len(valid_indices)}/{raw_count} samples remaining.", flush=True)
+    
+    if len(valid_indices) == 0:
+        print(f"ERROR: All samples were filtered out!")
+        print(f"DEBUG: First error encountered: {first_error}")
+        print("-" * 30)
+        print("POSSIBLE FIXES:")
+        print("1. Run 'du -sh data/' to check if files are actually downloaded (~6.4GB).")
+        print("2. Run 'sudo apt-get install sox libsox-fmt-all' if on Linux.")
+        print("-" * 30)
+        return
+
     train_set = torch.utils.data.Subset(train_set, valid_indices)
-    print(f"Filter complete: {len(train_set)} samples remaining.", flush=True)
 
     limit = limit_override if limit_override is not None else config['train'].get('train_limit_samples')
     if limit: train_set = torch.utils.data.Subset(train_set, range(min(limit, len(train_set))))
@@ -248,33 +319,34 @@ def train(limit_override=None):
                 mel = spec_norm(mel)
                 logits = model(mel, targets)
             
-            # RNN-T Length Logic
-            audio_lengths, target_lengths = audio_lengths.to(DEVICE), target_lengths.to(DEVICE)
-            # Match 4x subsampling: 160 hop -> Mel, then 2x stride-2 convs
-            # 16000 samples / 160 = 100 frames. 
-            # Conv1: (100-3)/2 + 1 = 49. Conv2: (49-3)/2 + 1 = 24.
-            l1 = torch.floor(((audio_lengths.float() / 160.0) - 3) / 2) + 1
-            input_lengths = (torch.floor((l1 - 3) / 2) + 1).to(torch.int32)
-            input_lengths = torch.clamp(input_lengths - 1, min=1)
+            # --- SAFE DYNAMIC LENGTH CALCULATION ---
+            # Input lengths: We calculate the relative length based on the raw audio and apply it 
+            # to the actual logits T dimension to avoid off-by-one CUDA errors.
+            max_t = logits.size(1)
+            max_u = logits.size(2)
             
+            # audio_lengths contains samples. 
+            # We know the encoder output length is T_logits. 
+            # We scale the relative length of each audio sample to the T_logits space.
+            batch_max_samples = audio_lengths.max().float()
+            input_lengths = torch.ceil((audio_lengths.float() / batch_max_samples) * max_t).to(torch.int32)
+            input_lengths = torch.clamp(input_lengths, min=1, max=max_t)
+            
+            # Target lengths: Must be at most U-1 since the loss looks at (u, u+1)
+            target_lengths = torch.clamp(target_lengths, min=0, max=max_u - 1)
+
+            # Extra Safety: RNN-T requires T > U-1 for the path to be valid
             for b_idx in range(input_lengths.size(0)):
                 if input_lengths[b_idx] <= target_lengths[b_idx]:
-                    target_lengths[b_idx] = torch.clamp(input_lengths[b_idx] - 1, min=0)
+                    input_lengths[b_idx] = torch.clamp(target_lengths[b_idx] + 1, max=max_t)
 
-            input_lengths = torch.clamp(input_lengths, max=logits.size(1))
-            target_lengths = torch.clamp(target_lengths, max=logits.size(2) - 1)
-            if input_lengths.max() < logits.size(1):
-                input_lengths[torch.argmax(input_lengths)] = logits.size(1)
-
-            use_cpu_loss = (DEVICE.type == "mps")
             loss = rnnt_loss(
-                logits=logits.float().cpu() if use_cpu_loss else logits.float(),
-                targets=targets.to(torch.int32).cpu() if use_cpu_loss else targets.to(torch.int32),
-                logit_lengths=input_lengths.cpu() if use_cpu_loss else input_lengths,
-                target_lengths=target_lengths.cpu() if use_cpu_loss else target_lengths,
+                logits=logits.float(),
+                targets=targets.to(torch.int32),
+                logit_lengths=input_lengths,
+                target_lengths=target_lengths,
                 blank=BLANK_IDX, reduction='mean'
             )
-            if use_cpu_loss: loss = loss.to(DEVICE)
             
             accum_steps = config['train']['accum_steps']
             scaler.scale(loss / accum_steps).backward()
