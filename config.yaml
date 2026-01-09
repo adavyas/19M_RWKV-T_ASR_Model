@@ -1,33 +1,33 @@
-# RWKV-T 19M B200 Training Configuration
+# RWKV-T Mac Test Configuration
+# For local testing on Mac (CPU/MPS) before GPU deployment
 
-# Model Architecture
+# Model Architecture (same as production)
 model:
   dim: 256
   n_enc: 12
   n_pred: 4
-  vocab_size: 2049  # 2048 BPE + 1 blank
+  vocab_size: 2049       # Original English BPE (2048 + 1 blank)
   dropout: 0.1
 
-# Training Hyperparameters
+# Training Hyperparameters (optimized for Mac)
 train:
-  batch_size: 32
-  accum_steps: 4     # Faster updates for initial convergence
-  lr: 1e-3            # Higher LR to escape blank collapse
-  epochs: 25
-  weight_decay: 0.01 # Lower regularization for ASR
+  batch_size: 16      # Balanced for stability with longer audio
+  accum_steps: 4      # Increased for gradient stability (Effective batch 64)
+  lr: 2e-5           # Set for stable convergence in Joint mode
+  epochs: 30          # Safe limit for Predictor pre-training
+  weight_decay: 0.01
   grad_clipping: 1.0
   seed: 42
-  num_workers: 12    # High throughput for B200 CPU
-  max_audio_duration: 30.0 # Full LibriSpeech coverage for B200
-  
+  num_workers: 4  
+  max_audio_duration: 10.0 # Doubled duration to increase hours per epoch
 
 # Metadata & Monitoring
 monitoring:
   wandb_project: "rwkv-t-asr"
-  log_interval: 10
-  validation_hook_interval: 1000
-  num_validation_samples: 5
-  export_manifest: true
+  log_interval: 1     # Log every batch for debugging
+  validation_hook_interval: 10
+  num_validation_samples: 2
+  export_manifest: false
 
 # Path Configuration
 paths:

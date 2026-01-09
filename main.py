@@ -38,7 +38,11 @@ class RWKV7_Block(nn.Module):
         self.delta_b = nn.Linear(dim, dim, bias=False)
         
         # Vector-valued decay
-        self.decay = nn.Parameter(torch.ones(dim)) 
+        self.decay = nn.Parameter(torch.ones(dim) * -3.0) # Slower decay for longer context
+        
+        # Output projections (Missing from earlier version)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.ffn_out_proj = nn.Linear(dim, dim, bias=False)
 
         # Channel-Mix (Simplified v7 Gating)
         # Hidden dim = 4 * dim = 1024
@@ -47,12 +51,11 @@ class RWKV7_Block(nn.Module):
         self.ffn_receptance = nn.Linear(dim, dim)
         
         # Initialization: Small std for state weights (std approx 0.01)
-        for p in [self.key, self.value, self.delta_a, self.delta_b]:
-            nn.init.normal_(p.weight, std=0.01)
+        for p in [self.key, self.value, self.delta_a, self.delta_b, self.out_proj, self.ffn_out_proj]:
+            nn.init.normal_(p.weight, std=0.02)
         
-        nn.init.orthogonal_(self.receptance.weight, gain=0.1)
-        nn.init.orthogonal_(self.gate.weight, gain=0.1)
-        nn.init.constant_(self.decay, 1.0)
+        nn.init.orthogonal_(self.receptance.weight, gain=2.0)
+        nn.init.orthogonal_(self.gate.weight, gain=2.0)
 
     def forward(self, x, state=None):
         xx = self.ln1(x)
@@ -73,65 +76,69 @@ class RWKV7_Block(nn.Module):
         
         states, state = rwkv7_recurrence(r, k, v, a, b, g, w, state)
         
-        # Apply normalization and gating to all timesteps at once
-        # states: [B, T, D]
+        # Apply normalization and gating
         b, t, d = states.size()
         norm_states = self.state_norm(states.view(b * t, d)).view(b, t, d)
-        mixed_out = torch.sigmoid(r) * norm_states * g
+        mixed_out = self.out_proj(torch.sigmoid(r) * norm_states * g)
         
         x = x + self.dropout(mixed_out)
         
         # MLP (Simplified v7 gating) with GRN
         xx = self.ln2(x)
         k_ffn = torch.square(torch.relu(self.ffn_key(xx)))
-        # Applying GRN to the bottleneck to increase feature diversity
         ffn_hidden = self.grn(self.ffn_value(k_ffn))
-        ffn_out = torch.sigmoid(self.ffn_receptance(xx)) * ffn_hidden
+        ffn_out = self.ffn_out_proj(torch.sigmoid(self.ffn_receptance(xx)) * ffn_hidden)
         x = x + self.dropout(ffn_out)
         
         return x, state
 
 # --- 2. TRANSDUCER COMPONENTS ---
+import torch
+import torch.nn as nn
+
 class Conv2dSubsampling(nn.Module):
-    """4x temporal subsampling front-end"""
-    def __init__(self, in_channels, out_channels, dropout=0.1):
+    def __init__(self, in_channels, dim):
         super().__init__()
+        # out_channels for the convs. 32 is standard for ASR front-ends.
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2),
+            # Layer 1: Downsample Freq (80->40) and Time (T->T/2)
+            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2),
+            # Layer 2: Downsample Freq (40->20) and Time (T/2->T/4)
+            # Stride 2 achieves the intended 4x temporal subsampling.
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.Dropout(dropout),
         )
+        
+        self.sub_h = 20 
+        self.out_dim = 32 * self.sub_h
+        
+        self.linear = nn.Linear(self.out_dim, dim)
 
     def forward(self, x):
-        # x: (B, 1, 80, T)
-        x = self.conv(x) # (B, C, F, T')
+        # x input: (B, 1, 80, T)
+        x = self.conv(x) # Output: (B, 32, 20, T/4)
+        
         b, c, f, t = x.size()
-        # We want (B, T', C * F)
+        # Reshape for sequence processing: (B, T/4, Channels * Freq)
         x = x.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
-        return x
-
+        
+        return self.linear(x)
 class RWKV_Encoder(nn.Module):
     def __init__(self, dim, n_layers, dropout=0.1):
         super().__init__()
-        # 4x temporal subsampling: two Conv2d layers with stride 2
-        # Input features: 80 Mel bins
-        self.subsampling = Conv2dSubsampling(1, dim, dropout=dropout)
-        # Linear projection to model dimension
-        # Note: after subsampling, height is approx (80-3)/2 + 1 = 39, then (39-3)/2 + 1 = 19
-        sub_h = (((80 - 3) // 2 + 1) - 3) // 2 + 1
-        self.linear = nn.Linear(dim * sub_h, dim)
+        # 4x temporal subsampling
+        self.subsampling = Conv2dSubsampling(1, dim)
         self.ln_in = nn.LayerNorm(dim)
+        
+        # Proper blocks init
         self.blocks = nn.ModuleList([RWKV7_Block(i, dim, dropout=dropout) for i in range(n_layers)])
 
     def forward(self, x):
         # input x: (B, 80, T) from MelSpectrogram
         x = x.unsqueeze(1) # (B, 1, 80, T)
         x = self.subsampling(x)
-        # Verify shape before linear: (B, T', D*F)
-        x = self.linear(x)
+        # Verify shape: (B, T', D)
         x = self.ln_in(x)
         for block in self.blocks:
             x, _ = block(x)
@@ -184,9 +191,20 @@ class RWKV_Predictor(nn.Module):
             max_u_per_t = 5
             max_hyp_len = 500 # Global safety cap
             
+            # DEBUG: Check first frame probabilities
+            debug_first = (b == 0)
+            
             while t < max_t and len(hyp) < max_hyp_len:
                 # Join current frame t and current predictor state
                 logits = joiner(b_enc[:, t:t+1, :], pred_out[:, -1:, :])
+                
+                if debug_first and t == 0:
+                    probs = F.softmax(logits, dim=-1)
+                    blank_prob = probs[0, 0, 0, blank_idx].item()
+                    top5_probs, top5_ids = torch.topk(probs[0, 0, 0], 5)
+                    print(f"DEBUG greedy t=0: blank_prob={blank_prob:.4f}, top5_ids={top5_ids.tolist()}, top5_probs={top5_probs.tolist()}")
+                    debug_first = False
+                
                 token = torch.argmax(logits, dim=-1).item()
                 
                 if token == blank_idx or u >= max_u_per_t:
@@ -210,6 +228,10 @@ class Transducer_Joiner(nn.Module):
         self.fc2 = nn.Linear(dim, dim)
         self.fc3 = nn.Linear(dim, vocab_size)
         self.dropout = nn.Dropout(dropout)
+        
+        # Initialize blank bias neutral
+        with torch.no_grad():
+            self.fc3.bias[vocab_size - 1] = 0.0
 
     def forward(self, enc_out, pred_out):
         t, u = enc_out.size(1), pred_out.size(1)
@@ -231,12 +253,18 @@ class RWKV_Transducer(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.blank_idx = vocab_size - 1
+        self.dim = dim
         self.encoder = RWKV_Encoder(dim, n_enc, dropout=dropout)
         # Predictor handles actual tokens; blank usually acts as BOS
         self.predictor = RWKV_Predictor(vocab_size, dim, n_pred, dropout=dropout)
         self.joiner = Transducer_Joiner(dim, vocab_size, dropout=dropout)
-        # CTC head for Blackwell stability pivot
+        # CTC head
         self.ctc_head = nn.Linear(dim, vocab_size)
+        
+        # Favor blank slightly to break the 'babbling' local minimum early
+        with torch.no_grad():
+            self.ctc_head.bias.fill_(0.0)
+            self.ctc_head.bias[self.blank_idx] = 1.0
 
     def forward(self, audio, labels):
         enc_out = self.encoder(audio)
@@ -260,9 +288,13 @@ class RWKV_Transducer(nn.Module):
         return self.predictor.greedy_decode(enc_out, self.joiner, self.blank_idx)
 
     @torch.no_grad()
-    def greedy_decode_ctc(self, audio):
+    def greedy_decode_ctc(self, audio, input_lengths=None, blank_suppression=0.0):
         self.eval()
-        logits = self.forward_ctc(audio) # [B, T, C]
+        logits = self.forward_ctc(audio) # [B, T, V]
+        
+        if blank_suppression > 0:
+            logits[:, :, self.blank_idx] -= blank_suppression
+            
         probs = F.softmax(logits, dim=-1)
         best_path = torch.argmax(probs, dim=-1) # [B, T]
         
@@ -270,7 +302,8 @@ class RWKV_Transducer(nn.Module):
         for b in range(best_path.size(0)):
             hyp = []
             prev = None
-            for token in best_path[b]:
+            t_limit = input_lengths[b] if input_lengths is not None else best_path.size(1)
+            for token in best_path[b, :t_limit]:
                 token = token.item()
                 if token != self.blank_idx and token != prev:
                     hyp.append(token)
