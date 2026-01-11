@@ -5,6 +5,8 @@ pyyaml
 wandb
 soundfile
 numpy
-weave
 k2
-torchcodec
+psutil
+thop
+openai-whisper
+datasets

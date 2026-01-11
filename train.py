@@ -5,7 +5,20 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, IterableDataset
 import math
 import torchaudio
-from torchaudio.datasets import LIBRISPEECH
+import os
+import yaml
+import json
+import time
+import random
+import argparse
+import csv
+import wandb
+
+# Modular imports
+from model import RWKV_Transducer
+from dataloader import get_dataloaders
+from utils import calculate_wer, get_tokenizer, get_git_hash, print_final_stats, estimate_flops
+
 # Try k2 for pruned RNN-T, fall back to torchaudio rnnt_loss
 try:
     import k2
@@ -17,20 +30,6 @@ except ImportError:
     from torchaudio.functional import rnnt_loss as torchaudio_rnnt_loss
     USE_TORCHAUDIO_RNNT = True
     print("k2 not available, using torchaudio.rnnt_loss on CPU")
-import os
-import sentencepiece as spm
-import yaml
-import json
-import time
-import subprocess
-import random
-import traceback
-import argparse
-import concurrent.futures
-import csv
-import wandb
-from main import RWKV_Transducer, print_final_stats
-from dataloader import get_dataloaders
 
 # --- 1. ENVIRONMENT SETUP ---
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -74,33 +73,7 @@ try:
 except Exception as e:
     print(f"Warning: Could not explicitly set audio backend: {e}")
 
-def get_tokenizer(model_path):
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Tokenizer model {model_path} not found. Run tokenizer_trainer.py first.")
-    sp = spm.SentencePieceProcessor()
-    sp.Load(model_path)
-    return sp
-
-def get_git_hash():
-    try:
-        return subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
-    except:
-        return "no-git-repo"
-
-def calculate_wer(reference, hypothesis):
-    """Simple WER implementation using Levenshtein distance"""
-    ref_words = reference.split()
-    hyp_words = hypothesis.split()
-    d = torch.zeros((len(ref_words) + 1, len(hyp_words) + 1))
-    for i in range(len(ref_words) + 1): d[i, 0] = i
-    for j in range(len(hyp_words) + 1): d[0, j] = j
-    for i in range(1, len(ref_words) + 1):
-        for j in range(1, len(hyp_words) + 1):
-            if ref_words[i-1] == hyp_words[j-1]: 
-                d[i, j] = d[i-1, j-1]
-            else: 
-                d[i, j] = min(d[i-1, j], d[i, j-1], d[i-1, j-1]) + 1
-    return d[len(ref_words), len(hyp_words)].item() / max(1, len(ref_words))
+# --- 2. DATA PREPROCESSING MOVED TO DATALOADER.PY ---
 
 # --- 2. DATA PREPROCESSING MOVED TO DATALOADER.PY ---
 
@@ -229,7 +202,6 @@ def train(limit_override=None, mode="joint", batch_size_override=None, fresh=Fal
     #     except Exception as e:
     #         print(f"torch.compile failed, falling back to eager: {e}")
 
-    from main import estimate_flops
     print_final_stats(model, time_steps=25, label_steps=20)
     # Estimate Training GFLOPS/sec (approximate)
     train_mflops = estimate_flops(model, batch_size=config['train']['batch_size'], time_steps=25, label_steps=20, is_training=True)
